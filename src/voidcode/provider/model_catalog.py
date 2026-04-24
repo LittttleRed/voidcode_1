@@ -4,10 +4,11 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from .config import LiteLLMProviderConfig
 
@@ -40,6 +41,30 @@ class ModelDiscoveryResult:
     source: str
     last_refresh_status: str
     last_error: str | None
+
+
+class _DiscoveryPayloadModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+
+class _OpenAICompatibleModelItem(_DiscoveryPayloadModel):
+    id: str | None = None
+
+
+class _OpenAICompatibleDiscoveryPayload(_DiscoveryPayloadModel):
+    data: list[str | _OpenAICompatibleModelItem] | None = None
+
+
+class _AnthropicDiscoveryPayload(_DiscoveryPayloadModel):
+    data: list[_OpenAICompatibleModelItem] | None = None
+
+
+class _GoogleModelItem(_DiscoveryPayloadModel):
+    name: str | None = None
+
+
+class _GoogleDiscoveryPayload(_DiscoveryPayloadModel):
+    models: list[_GoogleModelItem] | None = None
 
 
 def discover_available_models(
@@ -159,6 +184,50 @@ def _fetch_models(request: DiscoveryRequest) -> tuple[str, ...]:
     return _fetch_openai_compatible_models(request)
 
 
+def _parse_openai_compatible_discovery_payload(payload: object) -> tuple[str, ...]:
+    try:
+        parsed = _OpenAICompatibleDiscoveryPayload.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError("provider model discovery response must be an object") from exc
+    if parsed.data is None:
+        return ()
+    model_ids: list[str] = []
+    for item in parsed.data:
+        if isinstance(item, str) and item:
+            model_ids.append(item)
+            continue
+        if isinstance(item, _OpenAICompatibleModelItem) and item.id:
+            model_ids.append(item.id)
+    return tuple(model_ids)
+
+
+def _parse_anthropic_discovery_payload(payload: object) -> tuple[str, ...]:
+    try:
+        parsed = _AnthropicDiscoveryPayload.model_validate(payload)
+    except ValidationError:
+        return ()
+    if parsed.data is None:
+        return ()
+    return tuple(item.id for item in parsed.data if item.id)
+
+
+def _parse_google_discovery_payload(payload: object) -> tuple[str, ...]:
+    try:
+        parsed = _GoogleDiscoveryPayload.model_validate(payload)
+    except ValidationError:
+        return ()
+    if parsed.models is None:
+        return ()
+
+    model_ids: list[str] = []
+    for item in parsed.models:
+        raw_name = item.name
+        if isinstance(raw_name, str) and raw_name:
+            normalized = raw_name[len("models/") :] if raw_name.startswith("models/") else raw_name
+            model_ids.append(normalized)
+    return tuple(model_ids)
+
+
 def _fetch_openai_compatible_models(
     request: DiscoveryRequest,
 ) -> tuple[str, ...]:
@@ -176,24 +245,7 @@ def _fetch_openai_compatible_models(
     with urlopen(http_request, timeout=request.timeout_seconds) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
 
-    if not isinstance(payload, dict):
-        raise ValueError("provider model discovery response must be an object")
-    payload_dict = cast(dict[str, object], payload)
-    raw_data = payload_dict.get("data")
-    if not isinstance(raw_data, list):
-        return ()
-    raw_items = cast(list[object], raw_data)
-
-    model_ids: list[str] = []
-    for item in raw_items:
-        if isinstance(item, str) and item:
-            model_ids.append(item)
-            continue
-        if isinstance(item, dict):
-            raw_id = cast(dict[str, object], item).get("id")
-            if isinstance(raw_id, str) and raw_id:
-                model_ids.append(raw_id)
-    return tuple(model_ids)
+    return _parse_openai_compatible_discovery_payload(payload)
 
 
 def _fetch_anthropic_models(request: DiscoveryRequest) -> tuple[str, ...]:
@@ -203,21 +255,7 @@ def _fetch_anthropic_models(request: DiscoveryRequest) -> tuple[str, ...]:
     with urlopen(http_request, timeout=request.timeout_seconds) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
 
-    if not isinstance(payload, dict):
-        return ()
-    payload_dict = cast(dict[str, object], payload)
-    raw_data = payload_dict.get("data")
-    if not isinstance(raw_data, list):
-        return ()
-
-    model_ids: list[str] = []
-    for item in cast(list[object], raw_data):
-        if not isinstance(item, dict):
-            continue
-        raw_id = cast(dict[str, object], item).get("id")
-        if isinstance(raw_id, str) and raw_id:
-            model_ids.append(raw_id)
-    return tuple(model_ids)
+    return _parse_anthropic_discovery_payload(payload)
 
 
 def _fetch_google_models(request: DiscoveryRequest) -> tuple[str, ...]:
@@ -246,19 +284,4 @@ def _fetch_google_models(request: DiscoveryRequest) -> tuple[str, ...]:
     with urlopen(http_request, timeout=request.timeout_seconds) as response:  # noqa: S310
         payload = json.loads(response.read().decode("utf-8"))
 
-    if not isinstance(payload, dict):
-        return ()
-    payload_dict = cast(dict[str, object], payload)
-    raw_models = payload_dict.get("models")
-    if not isinstance(raw_models, list):
-        return ()
-
-    model_ids: list[str] = []
-    for item in cast(list[object], raw_models):
-        if not isinstance(item, dict):
-            continue
-        raw_name = cast(dict[str, object], item).get("name")
-        if isinstance(raw_name, str) and raw_name:
-            normalized = raw_name[len("models/") :] if raw_name.startswith("models/") else raw_name
-            model_ids.append(normalized)
-    return tuple(model_ids)
+    return _parse_google_discovery_payload(payload)
